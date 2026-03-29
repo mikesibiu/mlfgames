@@ -1,0 +1,714 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>Track Switcher</title>
+</head>
+<body style="margin:0;padding:0;background:#000">
+  <div id="root"></div>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    // ─── Constants ────────────────────────────────────────────────────────────
+    const WIN_COUNT = 20;
+    const LEVELS = [
+      { label: "Level 1", minDodged: 0,  speed: 180, spawnMs: 2200 },
+      { label: "Level 2", minDodged: 7,  speed: 280, spawnMs: 1600 },
+      { label: "Level 3", minDodged: 14, speed: 400, spawnMs: 1100 },
+    ];
+    const getLevel = (dodged) => [...LEVELS].reverse().find(l => dodged >= l.minDodged);
+    const INVINCIBLE_MS = 1500;
+    const TRAIN_LEFT_PCT = 0.05;
+    const TRAIN_WIDTH = 72;
+    const OBS_WIDTH = 60;
+    const OBS_HEIGHT = 44;
+    let _uid = 0;
+    const uid = () => ++_uid;
+
+    // ─── Audio ────────────────────────────────────────────────────────────────
+    let _audioCtx = null;
+    const ac = () => {
+      if (!_audioCtx) _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      return _audioCtx;
+    };
+    const tone = (freq, dur, vol = 0.3, delay = 0, type = "sine", ramp = true) => {
+      try {
+        const ctx = ac();
+        const o = ctx.createOscillator();
+        const g = ctx.createGain();
+        o.connect(g); g.connect(ctx.destination);
+        o.type = type; o.frequency.value = freq;
+        const t = ctx.currentTime + delay;
+        g.gain.setValueAtTime(vol, t);
+        if (ramp) g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+        else g.gain.setValueAtTime(0, t + dur);
+        o.start(t); o.stop(t + dur + 0.02);
+      } catch (e) {}
+    };
+    const snd = {
+      switch() {
+        tone(800, 0.04, 0.4, 0, "square");
+        tone(1200, 0.04, 0.3, 0.04, "square");
+      },
+      dodge() {
+        tone(600, 0.06, 0.2, 0, "sine");
+        tone(900, 0.08, 0.15, 0.05, "sine");
+      },
+      hit() {
+        tone(80, 0.18, 0.6, 0, "sawtooth");
+        tone(440, 0.12, 0.4, 0, "square");
+        tone(330, 0.15, 0.3, 0.1, "square");
+      },
+      levelUp() {
+        [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.2, 0.25, i * 0.1, "sine"));
+      },
+      win() {
+        // Jingle bells melody
+        const notes = [329,329,329, 329,329,329, 329,392,261,293,329, 349,349,349,349, 349,329,329,329, 329,293,293,329,293,392];
+        const durs  = [.12,.12,.25, .12,.12,.25, .12,.12,.12,.12,.5,  .12,.12,.12,.12, .12,.12,.12,.12, .12,.12,.12,.12,.12,.45];
+        let t = 0;
+        notes.forEach((f, i) => { tone(f, durs[i], 0.28, t); t += durs[i] + 0.01; });
+      },
+      gameOver() {
+        [523, 440, 349, 261].forEach((f, i) => tone(f, 0.3, 0.3, i * 0.22, "sine"));
+      },
+    };
+
+    // ─── Obstacle shapes ─────────────────────────────────────────────────────
+    const OBSTACLE_TYPES = ["snowdrift", "broken_rail", "boulder"];
+    function ObstacleSVG({ type, width = OBS_WIDTH, height = OBS_HEIGHT }) {
+      if (type === "snowdrift") {
+        return (
+          <svg width={width} height={height} viewBox="0 0 60 44" xmlns="http://www.w3.org/2000/svg">
+            <ellipse cx="30" cy="36" rx="28" ry="14" fill="#d0e8ff" stroke="#a0c8f0" strokeWidth="1.5"/>
+            <ellipse cx="20" cy="28" rx="16" ry="12" fill="#e8f4ff" stroke="#b0d4f8" strokeWidth="1"/>
+            <ellipse cx="38" cy="30" rx="14" ry="10" fill="#e0f0ff" stroke="#b0d4f8" strokeWidth="1"/>
+            <ellipse cx="30" cy="20" rx="13" ry="10" fill="#f0f8ff" stroke="#c0dcff" strokeWidth="1"/>
+            <ellipse cx="30" cy="14" rx="9" ry="7" fill="#fff" stroke="#d0e8ff" strokeWidth="1"/>
+          </svg>
+        );
+      }
+      if (type === "broken_rail") {
+        return (
+          <svg width={width} height={height} viewBox="0 0 60 44" xmlns="http://www.w3.org/2000/svg">
+            <rect x="4" y="18" width="52" height="8" rx="3" fill="#8b6914" stroke="#5a4010" strokeWidth="1.5"/>
+            <rect x="10" y="10" width="8" height="24" rx="2" fill="#c8960a" stroke="#8b6914" strokeWidth="1"/>
+            <rect x="26" y="10" width="8" height="24" rx="2" fill="#c8960a" stroke="#8b6914" strokeWidth="1"/>
+            <rect x="42" y="10" width="8" height="24" rx="2" fill="#c8960a" stroke="#8b6914" strokeWidth="1"/>
+            <line x1="8" y1="8" x2="28" y2="36" stroke="#ff4444" strokeWidth="3" strokeLinecap="round"/>
+            <line x1="28" y1="8" x2="8" y2="36" stroke="#ff4444" strokeWidth="3" strokeLinecap="round"/>
+            <line x1="32" y1="8" x2="52" y2="36" stroke="#ff4444" strokeWidth="3" strokeLinecap="round"/>
+            <line x1="52" y1="8" x2="32" y2="36" stroke="#ff4444" strokeWidth="3" strokeLinecap="round"/>
+          </svg>
+        );
+      }
+      // boulder
+      return (
+        <svg width={width} height={height} viewBox="0 0 60 44" xmlns="http://www.w3.org/2000/svg">
+          <ellipse cx="30" cy="28" rx="26" ry="18" fill="#6b6b6b" stroke="#444" strokeWidth="1.5"/>
+          <ellipse cx="22" cy="22" rx="10" ry="7" fill="#888" stroke="none"/>
+          <ellipse cx="38" cy="20" rx="7" ry="5" fill="#808080" stroke="none"/>
+          <ellipse cx="28" cy="16" rx="5" ry="3.5" fill="#999" stroke="none"/>
+          <ellipse cx="30" cy="38" rx="22" ry="5" fill="rgba(0,0,0,0.25)" stroke="none"/>
+        </svg>
+      );
+    }
+
+    // ─── Train SVG ────────────────────────────────────────────────────────────
+    function TrainSVG({ shaking }) {
+      return (
+        <svg width="80" height="50" viewBox="0 0 80 50" xmlns="http://www.w3.org/2000/svg"
+          style={{ filter: "drop-shadow(0 2px 6px rgba(255,215,0,0.4))" }}>
+          {/* Smoke */}
+          <circle cx="18" cy="6" r="4" fill="rgba(200,200,200,0.5)"/>
+          <circle cx="22" cy="3" r="3" fill="rgba(220,220,220,0.4)"/>
+          <circle cx="27" cy="1" r="2.5" fill="rgba(240,240,240,0.3)"/>
+          {/* Chimney */}
+          <rect x="14" y="10" width="8" height="6" rx="1" fill="#3a2a00"/>
+          <rect x="12" y="8" width="12" height="4" rx="2" fill="#4a3600"/>
+          {/* Body */}
+          <rect x="8" y="16" width="62" height="22" rx="5" fill="#c8960a"/>
+          <rect x="8" y="16" width="62" height="22" rx="5" fill="url(#trainGrad)" stroke="#ffd700" strokeWidth="1.5"/>
+          {/* Windows */}
+          <rect x="18" y="20" width="12" height="10" rx="2" fill="#a0d8ef" stroke="#ffd700" strokeWidth="1"/>
+          <rect x="36" y="20" width="12" height="10" rx="2" fill="#a0d8ef" stroke="#ffd700" strokeWidth="1"/>
+          <rect x="54" y="20" width="10" height="10" rx="2" fill="#a0d8ef" stroke="#ffd700" strokeWidth="1"/>
+          {/* Front cowcatcher */}
+          <polygon points="70,22 80,26 70,38" fill="#ffd700"/>
+          {/* Undercarriage */}
+          <rect x="10" y="36" width="58" height="6" rx="2" fill="#3a2a00"/>
+          {/* Wheels */}
+          <circle cx="20" cy="43" r="7" fill="#222" stroke="#ffd700" strokeWidth="2"/>
+          <circle cx="20" cy="43" r="3" fill="#ffd700"/>
+          <circle cx="38" cy="43" r="7" fill="#222" stroke="#ffd700" strokeWidth="2"/>
+          <circle cx="38" cy="43" r="3" fill="#ffd700"/>
+          <circle cx="56" cy="43" r="7" fill="#222" stroke="#ffd700" strokeWidth="2"/>
+          <circle cx="56" cy="43" r="3" fill="#ffd700"/>
+          {/* Gold stripe */}
+          <rect x="8" y="30" width="62" height="3" rx="1" fill="#ffd700" opacity="0.5"/>
+          <defs>
+            <linearGradient id="trainGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#e8ac12"/>
+              <stop offset="100%" stopColor="#a07208"/>
+            </linearGradient>
+          </defs>
+        </svg>
+      );
+    }
+
+    // ─── Stars ────────────────────────────────────────────────────────────────
+    const STARS = Array.from({ length: 80 }, (_, i) => ({
+      id: i,
+      left: Math.random() * 100,
+      top: Math.random() * 70,
+      size: 1 + Math.random() * 2.5,
+      dur: 1.5 + Math.random() * 2.5,
+      delay: Math.random() * 3,
+    }));
+
+    // ─── Snow particles ───────────────────────────────────────────────────────
+    const SNOW = Array.from({ length: 35 }, (_, i) => ({
+      id: i,
+      left: Math.random() * 100,
+      size: 2 + Math.random() * 4,
+      dur: 4 + Math.random() * 6,
+      delay: Math.random() * 8,
+      dx: (Math.random() - 0.5) * 60,
+    }));
+
+    // ─── CSS ──────────────────────────────────────────────────────────────────
+    const CSS = `
+      @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&display=swap');
+      * { box-sizing: border-box; }
+      .ts-root {
+        width: 100vw; height: 100vh; overflow: hidden; position: relative;
+        background: radial-gradient(ellipse at 50% 30%, #0e1a52 0%, #080e2e 55%, #040918 100%);
+        font-family: 'Playfair Display', Georgia, serif;
+        touch-action: manipulation;
+        user-select: none;
+        -webkit-user-select: none;
+      }
+      .star {
+        position: absolute; border-radius: 50%; background: #fff;
+        animation: twinkle var(--d) var(--delay) ease-in-out infinite alternate;
+      }
+      @keyframes twinkle {
+        from { opacity: 0.12; transform: scale(0.7); }
+        to   { opacity: 1;    transform: scale(1.3); }
+      }
+      .snow {
+        position: absolute; top: -8px; border-radius: 50%;
+        background: rgba(255,255,255,0.82); pointer-events: none;
+        animation: snowfall var(--d) var(--delay) linear infinite;
+      }
+      @keyframes snowfall {
+        from { transform: translateY(0) translateX(0); opacity: 0.9; }
+        to   { transform: translateY(101vh) translateX(var(--dx)); opacity: 0.1; }
+      }
+      .train-wrap {
+        position: absolute;
+        transition: top 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+      }
+      @keyframes trainShake {
+        0%   { transform: translateX(0); }
+        20%  { transform: translateX(-8px) rotate(-2deg); }
+        40%  { transform: translateX(8px)  rotate(2deg); }
+        60%  { transform: translateX(-6px) rotate(-1deg); }
+        80%  { transform: translateX(6px)  rotate(1deg); }
+        100% { transform: translateX(0)   rotate(0deg); }
+      }
+      .shake { animation: trainShake 0.4s ease; }
+      .track-line {
+        position: absolute; left: 0; right: 0; pointer-events: none;
+      }
+      .obstacle {
+        position: absolute;
+        pointer-events: none;
+      }
+      .flash-overlay {
+        position: fixed; inset: 0; pointer-events: none;
+        background: rgba(255,0,0,0.35);
+        animation: flashOut 0.4s ease forwards;
+      }
+      @keyframes flashOut {
+        from { opacity: 1; }
+        to   { opacity: 0; }
+      }
+      .hud {
+        position: absolute; top: 0; left: 0; right: 0;
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 10px 16px 0;
+        z-index: 10;
+        pointer-events: none;
+      }
+      .hud-lives { font-size: clamp(18px, 4vw, 26px); letter-spacing: 2px; }
+      .hud-score {
+        color: #ffd700; font-size: clamp(14px, 3vw, 20px);
+        font-weight: 700; text-align: center;
+      }
+      .hud-level {
+        color: #c8960a; font-size: clamp(12px, 2.5vw, 17px);
+        font-weight: 700; text-align: right;
+      }
+      .screen-center {
+        position: absolute; inset: 0;
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        z-index: 20;
+      }
+      .title {
+        color: #ffd700;
+        font-size: clamp(36px, 9vw, 76px);
+        font-weight: 900;
+        text-shadow: 0 0 30px rgba(255,215,0,0.7), 0 4px 8px rgba(0,0,0,0.8);
+        text-align: center;
+        line-height: 1.1;
+        margin: 0 16px 8px;
+      }
+      .subtitle {
+        color: #c8deff;
+        font-size: clamp(14px, 3.5vw, 22px);
+        text-align: center;
+        margin: 0 20px 6px;
+        opacity: 0.9;
+      }
+      .instructions {
+        color: rgba(200,220,255,0.75);
+        font-size: clamp(12px, 2.8vw, 18px);
+        text-align: center;
+        margin: 4px 20px 24px;
+      }
+      .btn {
+        background: linear-gradient(135deg, #ffd700, #c8960a);
+        color: #0a0820;
+        border: none; border-radius: 12px;
+        padding: clamp(10px,2vh,16px) clamp(24px,6vw,48px);
+        font-family: 'Playfair Display', Georgia, serif;
+        font-size: clamp(16px, 4vw, 24px);
+        font-weight: 900;
+        cursor: pointer;
+        box-shadow: 0 4px 20px rgba(255,215,0,0.45), 0 2px 6px rgba(0,0,0,0.5);
+        transition: transform 0.1s, box-shadow 0.1s;
+      }
+      .btn:active { transform: scale(0.96); box-shadow: 0 2px 8px rgba(255,215,0,0.3); }
+      .result-stat {
+        color: #c8deff;
+        font-size: clamp(14px, 3vw, 20px);
+        margin: 6px 0 20px;
+        text-align: center;
+      }
+      .invinc-bar {
+        position: absolute; bottom: 4px; left: 8%; right: 8%; height: 4px;
+        background: rgba(255,255,255,0.15); border-radius: 2px; overflow: hidden;
+      }
+      .invinc-fill {
+        height: 100%; background: #ff6666; border-radius: 2px;
+        transition: width 0.1s linear;
+      }
+    `;
+
+    // ─── Main Game Component ──────────────────────────────────────────────────
+    function TrackSwitcher() {
+      // screen: 'start' | 'play' | 'win' | 'gameover'
+      const [screen, setScreen]       = useState("start");
+      const [trainTrack, setTrainTrack] = useState(0); // 0 = top, 1 = bottom
+      const [obstacles, setObstacles] = useState([]);
+      const [lives, setLives]         = useState(3);
+      const [dodged, setDodged]       = useState(0);
+      const [level, setLevel]         = useState(LEVELS[0]);
+      const [shaking, setShaking]     = useState(false);
+      const [flashKey, setFlashKey]   = useState(null);
+      const [invincible, setInvincible] = useState(false);
+      const [invincPct, setInvincPct] = useState(0); // 0–100
+      const [blinkVisible, setBlinkVisible] = useState(true);
+
+      // refs to avoid stale closures in requestAnimationFrame
+      const stateRef = useRef({});
+      stateRef.current = { trainTrack, obstacles, lives, dodged, level, invincible, screen };
+
+      const animRef    = useRef(null);
+      const lastRef    = useRef(null);
+      const spawnRef   = useRef(null);
+      const invincRef  = useRef(null);
+      const shakeRef   = useRef(null);
+      const blinkRef   = useRef(null);
+
+      // Dimensions
+      const [dims, setDims] = useState({ w: window.innerWidth, h: window.innerHeight });
+      useEffect(() => {
+        const onResize = () => setDims({ w: window.innerWidth, h: window.innerHeight });
+        window.addEventListener("resize", onResize);
+        return () => window.removeEventListener("resize", onResize);
+      }, []);
+
+      // Track Y positions (center of track)
+      const TRACK_TOP    = Math.round(dims.h * 0.35);
+      const TRACK_BOTTOM = Math.round(dims.h * 0.65);
+      const trackYs = [TRACK_TOP, TRACK_BOTTOM];
+
+      // Train position
+      const trainX = Math.round(dims.w * TRAIN_LEFT_PCT);
+      const trainY = trackYs[trainTrack] - 25; // top of train sprite (50px tall)
+
+      // ── Spawn obstacle ──────────────────────────────────────────────────────
+      const spawnObstacle = useCallback(() => {
+        const { trainTrack: curTrack, level: lvl, screen: s } = stateRef.current;
+        if (s !== "play") return;
+        // 30% chance same track as player to keep it spicy
+        const track = Math.random() < 0.30 ? curTrack : (Math.random() < 0.5 ? 0 : 1);
+        const type = OBSTACLE_TYPES[Math.floor(Math.random() * OBSTACLE_TYPES.length)];
+        setObstacles(prev => [...prev, {
+          id: uid(),
+          x: dims.w + 10,
+          track,
+          type,
+          speed: lvl.speed,
+        }]);
+      }, [dims.w]);
+
+      // ── Start game loop ─────────────────────────────────────────────────────
+      const startGame = useCallback(() => {
+        // Reset state
+        setScreen("play");
+        setTrainTrack(0);
+        setObstacles([]);
+        setLives(3);
+        setDodged(0);
+        setLevel(LEVELS[0]);
+        setShaking(false);
+        setFlashKey(null);
+        setInvincible(false);
+        setInvincPct(0);
+        setBlinkVisible(true);
+        clearInterval(blinkRef.current);
+        clearTimeout(invincRef.current);
+        lastRef.current = null;
+      }, []);
+
+      // ── Switch track (tap handler) ──────────────────────────────────────────
+      const handleTap = useCallback(() => {
+        if (stateRef.current.screen !== "play") return;
+        snd.switch();
+        setTrainTrack(t => 1 - t);
+      }, []);
+
+      // ── Game loop ───────────────────────────────────────────────────────────
+      useEffect(() => {
+        if (screen !== "play") {
+          cancelAnimationFrame(animRef.current);
+          clearInterval(spawnRef.current);
+          return;
+        }
+
+        // Spawn timer
+        const scheduleSpawn = (ms) => {
+          clearInterval(spawnRef.current);
+          spawnRef.current = setInterval(spawnObstacle, ms);
+        };
+        scheduleSpawn(level.spawnMs);
+        // Spawn one immediately
+        setTimeout(spawnObstacle, 300);
+
+        let prevLevel = level;
+
+        const loop = (ts) => {
+          if (stateRef.current.screen !== "play") return;
+          const dt = lastRef.current ? Math.min((ts - lastRef.current) / 1000, 0.1) : 0;
+          lastRef.current = ts;
+
+          const { trainTrack: tt, invincible: inv, lives: lv, dodged: dd, level: lvl } = stateRef.current;
+          const trainRight = trainX + TRAIN_WIDTH;
+
+          setObstacles(prev => {
+            let newDodged = 0;
+            let hitOccurred = false;
+
+            const next = prev
+              .map(ob => ({ ...ob, x: ob.x - ob.speed * dt }))
+              .filter(ob => {
+                if (ob.x + OBS_WIDTH < 0) return false; // gone off left
+                return true;
+              });
+
+            // Check collisions and count dodged
+            const survived = [];
+            for (const ob of next) {
+              // Collision check first: obstacle overlaps train horizontally and is on same track
+              const overlapsX = ob.x < trainRight && ob.x + OBS_WIDTH > trainX;
+              if (!inv && overlapsX && ob.track === tt && !ob.hit && !ob.counted) {
+                hitOccurred = true;
+                survived.push({ ...ob, hit: true });
+                continue;
+              }
+
+              // Dodged: passed the train's left edge (obstacle right < train left)
+              // Count every obstacle that passes successfully (wasn't hit)
+              if (!ob.counted && ob.x + OBS_WIDTH < trainX) {
+                newDodged++;
+                survived.push({ ...ob, counted: true });
+                continue;
+              }
+              survived.push(ob);
+            }
+
+            if (newDodged > 0) {
+              snd.dodge();
+              setDodged(prev => {
+                const next = prev + newDodged;
+                // Level up?
+                const newLvl = getLevel(next);
+                if (newLvl.minDodged > lvl.minDodged) {
+                  snd.levelUp();
+                  setLevel(newLvl);
+                }
+                // Win?
+                if (next >= WIN_COUNT) {
+                  setTimeout(() => {
+                    snd.win();
+                    setScreen("win");
+                  }, 0);
+                }
+                return next;
+              });
+            }
+
+            if (hitOccurred && !inv) {
+              snd.hit();
+              setFlashKey(Date.now());
+              setShaking(true);
+              clearTimeout(shakeRef.current);
+              shakeRef.current = setTimeout(() => setShaking(false), 450);
+              setInvincible(true);
+              setInvincPct(100);
+              setBlinkVisible(true);
+
+              clearTimeout(invincRef.current);
+              clearInterval(blinkRef.current);
+
+              // Blink the train
+              blinkRef.current = setInterval(() => setBlinkVisible(v => !v), 120);
+
+              // Count down invincibility bar
+              const startTime = Date.now();
+              const tick = () => {
+                const elapsed = Date.now() - startTime;
+                const pct = Math.max(0, 100 - (elapsed / INVINCIBLE_MS) * 100);
+                setInvincPct(pct);
+                if (pct > 0) invincRef.current = setTimeout(tick, 50);
+              };
+              invincRef.current = setTimeout(tick, 50);
+              setTimeout(() => {
+                setInvincible(false);
+                setBlinkVisible(true);
+                clearInterval(blinkRef.current);
+              }, INVINCIBLE_MS);
+
+              setLives(prev => {
+                const next = prev - 1;
+                if (next <= 0) {
+                  setTimeout(() => {
+                    snd.gameOver();
+                    setScreen("gameover");
+                  }, 300);
+                }
+                return next;
+              });
+            }
+
+            return survived;
+          });
+
+          // Re-schedule spawn if level changed
+          const curLevel = stateRef.current.level;
+          if (curLevel !== prevLevel) {
+            scheduleSpawn(curLevel.spawnMs);
+            prevLevel = curLevel;
+          }
+
+          animRef.current = requestAnimationFrame(loop);
+        };
+
+        animRef.current = requestAnimationFrame(loop);
+        return () => {
+          cancelAnimationFrame(animRef.current);
+          clearInterval(spawnRef.current);
+        };
+      }, [screen]); // eslint-disable-line
+
+      // ── Render ───────────────────────────────────────────────────────────────
+      const livesEmojis = Array.from({ length: 3 }, (_, i) => (
+        <span key={i} style={{ opacity: i < lives ? 1 : 0.2 }}>🚂</span>
+      ));
+
+      return (
+        <div
+          className="ts-root"
+          onClick={handleTap}
+          style={{ cursor: screen === "play" ? "pointer" : "default" }}
+        >
+          <style>{CSS}</style>
+
+          {/* Stars */}
+          {STARS.map(s => (
+            <div key={s.id} className="star" style={{
+              left: `${s.left}%`, top: `${s.top}%`,
+              width: s.size, height: s.size,
+              "--d": `${s.dur}s`, "--delay": `${s.delay}s`,
+            }} />
+          ))}
+
+          {/* Snow */}
+          {SNOW.map(s => (
+            <div key={s.id} className="snow" style={{
+              left: `${s.left}%`,
+              width: s.size, height: s.size,
+              "--d": `${s.dur}s`, "--delay": `${s.delay}s`,
+              "--dx": `${s.dx}px`,
+            }} />
+          ))}
+
+          {/* ── START SCREEN ── */}
+          {screen === "start" && (
+            <div className="screen-center">
+              <div className="title">🚂 Track Switcher</div>
+              <div className="subtitle">Switch tracks to dodge obstacles!</div>
+              <div className="instructions">Tap anywhere to switch tracks!</div>
+              <button
+                className="btn"
+                onClick={e => { e.stopPropagation(); snd.switch(); startGame(); }}
+              >
+                All Aboard! 🚂
+              </button>
+            </div>
+          )}
+
+          {/* ── PLAY SCREEN ── */}
+          {screen === "play" && (
+            <>
+              {/* HUD */}
+              <div className="hud">
+                <div className="hud-lives">{livesEmojis}</div>
+                <div className="hud-score">
+                  <div style={{ color: "#ffd700", fontSize: "0.85em" }}>Dodged</div>
+                  <div style={{ fontSize: "1.4em" }}>{dodged} / {WIN_COUNT}</div>
+                </div>
+                <div className="hud-level">{level.label}</div>
+              </div>
+
+              {/* Tracks */}
+              {[0, 1].map(ti => (
+                <div key={ti} className="track-line" style={{ top: trackYs[ti] }}>
+                  {/* Rail ties */}
+                  {Array.from({ length: Math.ceil(dims.w / 40) + 1 }, (_, i) => (
+                    <div key={i} style={{
+                      position: "absolute",
+                      left: i * 40 - 8, top: -8,
+                      width: 18, height: 16,
+                      background: "#4a3000",
+                      borderRadius: 3,
+                    }} />
+                  ))}
+                  {/* Top rail */}
+                  <div style={{
+                    position: "absolute", left: 0, right: 0, top: -3,
+                    height: 4, background: "linear-gradient(to right, #aaa, #ccc, #aaa)",
+                    borderRadius: 2,
+                  }} />
+                  {/* Bottom rail */}
+                  <div style={{
+                    position: "absolute", left: 0, right: 0, top: 6,
+                    height: 4, background: "linear-gradient(to right, #aaa, #ccc, #aaa)",
+                    borderRadius: 2,
+                  }} />
+                </div>
+              ))}
+
+              {/* Train */}
+              <div
+                className={`train-wrap${shaking ? " shake" : ""}`}
+                style={{
+                  left: trainX,
+                  top: trainY,
+                  width: TRAIN_WIDTH,
+                  opacity: invincible ? (blinkVisible ? 1 : 0.2) : 1,
+                  zIndex: 5,
+                }}
+              >
+                <TrainSVG shaking={shaking} />
+              </div>
+
+              {/* Obstacles */}
+              {obstacles.map(ob => (
+                <div
+                  key={ob.id}
+                  className="obstacle"
+                  style={{
+                    left: ob.x,
+                    top: trackYs[ob.track] - OBS_HEIGHT + 8,
+                    width: OBS_WIDTH,
+                    height: OBS_HEIGHT,
+                    zIndex: 4,
+                  }}
+                >
+                  <ObstacleSVG type={ob.type} />
+                </div>
+              ))}
+
+              {/* Red flash on hit */}
+              {flashKey && <div key={flashKey} className="flash-overlay" />}
+
+              {/* Invincibility bar */}
+              {invincible && (
+                <div className="invinc-bar" style={{ top: trackYs[trainTrack] + 12 }}>
+                  <div className="invinc-fill" style={{ width: `${invincPct}%` }} />
+                </div>
+              )}
+            </>
+          )}
+
+          {/* ── WIN SCREEN ── */}
+          {screen === "win" && (
+            <div className="screen-center">
+              <div className="title">🎉 You Made It!</div>
+              <div className="result-stat">You dodged all {WIN_COUNT} obstacles!</div>
+              <div className="result-stat" style={{ color: "#ffd700", fontSize: "1.3em", marginBottom: 24 }}>
+                🏆 Expert Engineer! 🏆
+              </div>
+              <button
+                className="btn"
+                onClick={e => { e.stopPropagation(); startGame(); }}
+              >
+                Play Again 🚂
+              </button>
+            </div>
+          )}
+
+          {/* ── GAME OVER SCREEN ── */}
+          {screen === "gameover" && (
+            <div className="screen-center">
+              <div className="title">💥 Derailed!</div>
+              <div className="result-stat">You dodged {dodged} obstacle{dodged !== 1 ? "s" : ""}</div>
+              <div className="result-stat" style={{ color: "#c8960a", marginBottom: 24 }}>
+                {dodged < 7 ? "Keep practicing!" : dodged < 14 ? "So close!" : "Almost there!"}
+              </div>
+              <button
+                className="btn"
+                onClick={e => { e.stopPropagation(); startGame(); }}
+              >
+                Try Again 🚂
+              </button>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ─── Mount ────────────────────────────────────────────────────────────────
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<TrackSwitcher />);
+  </script>
+</body>
+</html>
