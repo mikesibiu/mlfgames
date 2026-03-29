@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Polar Express Ticket Punch</title>
+</head>
+<body style="margin:0;padding:0;background:#000">
+  <div id="root"></div>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    const WIN = 20;
+    const LEVELS = [
+      { label: "🚂 All Aboard",        minScore: 0,  speedMult: 0.75, spawnMs: 1400, maxOnScreen: 5 },
+      { label: "🚂🚂 Full Steam",      minScore: 5,  speedMult: 1.0,  spawnMs: 1100, maxOnScreen: 6 },
+      { label: "🚂🚂🚂 Express!",      minScore: 10, speedMult: 1.25, spawnMs: 800,  maxOnScreen: 7 },
+      { label: "🚂🚂🚂🚂 RUNAWAY!!!",  minScore: 15, speedMult: 1.5,  spawnMs: 550,  maxOnScreen: 8 },
+    ];
+    const getLevel = score => [...LEVELS].reverse().find(l => score >= l.minScore);
+    let uid = 0;
+
+    let _ctx = null;
+    const ac = () => _ctx || (_ctx = new (window.AudioContext || window.webkitAudioContext)());
+    const tone = (f, dur, vol = 0.3, t0 = 0, type = "sine") => {
+      try {
+        const c = ac(), o = c.createOscillator(), g = c.createGain();
+        o.connect(g); g.connect(c.destination); o.type = type; o.frequency.value = f;
+        const t = c.currentTime + t0;
+        g.gain.setValueAtTime(vol, t);
+        g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+        o.start(t); o.stop(t + dur + 0.01);
+      } catch (e) {}
+    };
+    const snd = {
+      punch() { tone(220, 0.08, 0.5, 0, "sawtooth"); tone(55, 0.12, 0.4, 0.04); },
+      bells() { [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.55, 0.22, i * 0.13)); },
+      win() {
+        const m = [523, 523, 523, 523, 659, 523, 587, 494, 523];
+        const d = [.14, .14, .28, .14, .14, .28, .14, .14, .45];
+        let t = 0; m.forEach((f, i) => { tone(f, d[i], 0.3, t); t += d[i]; });
+        setTimeout(() => [523,659,784,1047].forEach((f,i)=>tone(f,.8,.25,i*.12)), 1800);
+      },
+    };
+
+    function mkTicket(W, H, speedMult = 1) {
+      const left = Math.random() > 0.5;
+      const base = 52 + Math.random() * 60; // original range
+      return {
+        id: ++uid,
+        x: left ? -140 : W + 15,
+        y: H * 0.13 + Math.random() * (H * 0.6),
+        vx: (left ? 1 : -1) * base * speedMult,
+        vy: (Math.random() - 0.5) * 20 * speedMult,
+        rot: (Math.random() - 0.5) * 32,
+      };
+    }
+
+    const CSS = `
+      @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&display=swap');
+      .pe-root {
+        width: 100vw; height: 100vh; overflow: hidden; position: relative;
+        background: radial-gradient(ellipse at 50% 30%, #0e1a52 0%, #080e2e 55%, #040918 100%);
+        font-family: 'Playfair Display', Georgia, serif;
+        cursor: default;
+      }
+      .st { position:absolute; border-radius:50%; background:#fff;
+        animation: twinkle var(--d) ease-in-out infinite alternate; }
+      @keyframes twinkle { from{opacity:.15;transform:scale(.7)} to{opacity:1;transform:scale(1.3)} }
+      .sn { position:absolute; top:-8px; border-radius:50%;
+        background:rgba(255,255,255,.8); pointer-events:none;
+        animation: snowfall var(--d) var(--delay) linear infinite; }
+      @keyframes snowfall {
+        from { transform: translateY(0) translateX(0); opacity:.9; }
+        to   { transform: translateY(101vh) translateX(var(--dx)); opacity:.1; }
+      }
+      .ground { position:absolute; bottom:0; left:0; right:0; height:90px;
+        background: linear-gradient(0deg,#0a0500 0%,#1a0c00 55%,transparent 100%); }
+      .tkt { position:absolute; cursor:pointer; user-select:none;
+        -webkit-tap-highlight-color:transparent; transition: filter .08s;
+        will-change: transform; }
+      .tkt:hover  { filter: brightness(1.15) drop-shadow(0 0 8px rgba(255,215,0,.8)); }
+      .tkt:active { filter: brightness(1.4)  drop-shadow(0 0 14px rgba(255,215,0,1)); }
+      .burst { position:fixed; pointer-events:none; z-index:200;
+        transform: translate(-50%,-50%);
+        animation: burst .55s ease-out forwards; }
+      @keyframes burst {
+        0%   { opacity:1; transform:translate(-50%,-50%) scale(0) rotate(0deg); }
+        60%  { opacity:1; transform:translate(-50%,-50%) scale(1.4) rotate(20deg); }
+        100% { opacity:0; transform:translate(-50%,-50%) scale(2)   rotate(40deg); }
+      }
+      .hud { position:absolute; top:14px; left:50%; transform:translateX(-50%);
+        background:rgba(0,0,10,.75); border:2px solid #c8960a; border-radius:50px;
+        padding:8px 28px; text-align:center; backdrop-filter:blur(6px);
+        min-width:270px; z-index:20; }
+      .hud-label { font-size:.65rem; letter-spacing:.15em; color:#a07828; margin-bottom:1px; }
+      .hud-score { font-size:2rem; font-weight:900; color:#ffd700; line-height:1.1; }
+      .hud-sub   { font-size:.65rem; color:#6070a0; margin-top:1px; }
+      .prog-track { height:9px; background:rgba(255,255,255,.08); border-radius:5px; margin:4px 0 0; }
+      .prog-fill  { height:100%; border-radius:5px;
+        background:linear-gradient(90deg,#b87e10,#ffd700,#ffe878);
+        transition:width .4s ease; }
+      .start { display:flex; flex-direction:column; align-items:center; justify-content:center;
+        height:100%; gap:20px; text-align:center; padding:20px; }
+      .s-eyebrow { font-size:clamp(.85rem,2.5vw,1.1rem); color:#c8960a; letter-spacing:.2em; text-transform:uppercase; }
+      .s-title   { font-size:clamp(2.8rem,9vw,5.5rem); font-weight:900; color:#ffd700; line-height:1.05;
+        text-shadow: 0 0 40px rgba(255,215,0,.5), 0 2px 6px rgba(0,0,0,.9); }
+      .s-badge   { font-size:clamp(.95rem,2.5vw,1.25rem); color:#8ab0e0; }
+      .s-desc    { color:rgba(200,185,145,.85); font-size:clamp(.85rem,2vw,1rem);
+        max-width:360px; line-height:1.65; }
+      .s-desc strong { color:#ffd700; }
+      .s-btn { background:linear-gradient(135deg,#b07818,#ffd700 45%,#b07818);
+        border:none; border-radius:10px; padding:16px 52px;
+        font-family:inherit; font-size:1.35rem; font-weight:700; color:#1a0800;
+        box-shadow:0 5px 25px rgba(200,150,10,.5); cursor:pointer; letter-spacing:.04em;
+        transition:all .18s; }
+      .s-btn:hover { transform:scale(1.07); box-shadow:0 8px 35px rgba(200,150,10,.8); }
+      .win { position:absolute; inset:0; display:flex; flex-direction:column;
+        align-items:center; justify-content:center; gap:18px; text-align:center; padding:20px;
+        background:radial-gradient(ellipse at center,rgba(10,5,40,.97) 0%,rgba(2,4,20,.99) 100%);
+        z-index:50; animation:winIn .5s ease-out; }
+      @keyframes winIn { from{opacity:0;transform:scale(.88)} to{opacity:1;transform:scale(1)} }
+      .w-emoji  { font-size:clamp(2rem,6vw,3.5rem); }
+      .w-title  { font-size:clamp(2rem,6.5vw,4rem); font-weight:900; color:#ffd700;
+        animation:glow 1.4s ease-in-out infinite alternate; }
+      @keyframes glow {
+        from { text-shadow: 0 0 15px rgba(255,215,0,.4); }
+        to   { text-shadow: 0 0 50px rgba(255,215,0,1), 0 0 90px rgba(255,215,0,.6); }
+      }
+      .w-sub    { font-size:clamp(1rem,2.5vw,1.4rem); color:#a0c0f0; }
+      .w-place  { font-size:clamp(1.4rem,4vw,2.4rem); font-weight:900; color:#ffd700; }
+      .w-believe { font-size:clamp(3rem,11vw,7rem); font-weight:900; letter-spacing:.08em;
+        background:linear-gradient(130deg,#ffd700,#fff 48%,#ffd700);
+        -webkit-background-clip:text; -webkit-text-fill-color:transparent;
+        animation:bpulse 2s ease-in-out infinite; }
+      @keyframes bpulse { 0%,100%{transform:scale(1)} 50%{transform:scale(1.05)} }
+      .w-count { font-size:.95rem; color:rgba(180,200,255,.8); }
+      .w-btn { background:linear-gradient(135deg,#b07818,#ffd700 45%,#b07818);
+        border:none; border-radius:8px; padding:13px 40px;
+        font-family:inherit; font-size:1.1rem; font-weight:700; color:#1a0800;
+        cursor:pointer; box-shadow:0 4px 20px rgba(200,150,10,.5); transition:all .18s; }
+      .w-btn:hover { transform:scale(1.06); }
+      .conf { position:fixed; border-radius:2px; pointer-events:none; z-index:60;
+        animation:cffall var(--d) var(--delay) linear forwards; }
+      @keyframes cffall {
+        from { transform:translateY(-10px) rotate(0deg) translateX(0); opacity:1; }
+        to   { transform:translateY(105vh) rotate(800deg) translateX(var(--dx)); opacity:0; }
+      }
+    `;
+
+    function TicketSVG({ num }) {
+      return (
+        <svg width="134" height="60" viewBox="0 0 134 60" style={{ display: "block" }}>
+          <path d="M10,2 H95 V14 A5,5 0 0 1 95,46 V58 H10 A8,8 0 0 1 2,50 V10 A8,8 0 0 1 10,2Z"
+            fill="#f8e898" stroke="#9a7010" strokeWidth="1.5" />
+          <path d="M95,2 H124 A8,8 0 0 1 132,10 V50 A8,8 0 0 1 124,58 H95 V46 A5,5 0 0 0 95,14Z"
+            fill="#e8c030" stroke="#9a7010" strokeWidth="1.5" />
+          {[5,12,19,26,33,40,47,54].map(y => (
+            <circle key={y} cx="95" cy={y} r="2.8" fill="#8a6010" />
+          ))}
+          <text x="49" y="19" textAnchor="middle" fontSize="8" fontFamily="Georgia,serif"
+            fill="#7a5010" fontWeight="bold" letterSpacing="1.5">POLAR EXPRESS</text>
+          <text x="49" y="35" textAnchor="middle" fontSize="14" fontFamily="Georgia,serif"
+            fill="#1a0a00" fontWeight="bold">ADMIT ONE</text>
+          <text x="49" y="49" textAnchor="middle" fontSize="7.5" fontFamily="Georgia,serif"
+            fill="#7a5010" letterSpacing="2">✦ NORTH POLE ✦</text>
+          <text x="113" y="24" textAnchor="middle" fontSize="7" fontFamily="Georgia,serif" fill="#5a3800">TICKET</text>
+          <text x="113" y="37" textAnchor="middle" fontSize="13" fontFamily="Georgia,serif" fill="#3a1800">★</text>
+          <text x="113" y="50" textAnchor="middle" fontSize="7" fontFamily="Georgia,serif" fill="#5a3800">
+            #{String(num).padStart(3, "0")}
+          </text>
+        </svg>
+      );
+    }
+
+    function Burst({ x, y }) {
+      return (
+        <div className="burst" style={{ left: x, top: y }}>
+          <svg width="70" height="70" viewBox="0 0 70 70">
+            <circle cx="35" cy="35" r="22" fill="none" stroke="#ffd700" strokeWidth="3" />
+            {[0, 45, 90, 135, 180, 225, 270, 315].map(a => (
+              <line key={a}
+                x1={35 + 24 * Math.cos(a * Math.PI / 180)}
+                y1={35 + 24 * Math.sin(a * Math.PI / 180)}
+                x2={35 + 33 * Math.cos(a * Math.PI / 180)}
+                y2={35 + 33 * Math.sin(a * Math.PI / 180)}
+                stroke="#ffd700" strokeWidth="2.5" />
+            ))}
+            <circle cx="35" cy="35" r="10" fill="rgba(255,215,0,.85)" />
+            <text x="35" y="39" textAnchor="middle" fontSize="12" fill="#1a0800" fontWeight="bold">✓</text>
+          </svg>
+        </div>
+      );
+    }
+
+    function PolarExpress() {
+      const [phase, setPhase] = useState("start");
+      const [score, setScore] = useState(0);
+      const [tickets, setTickets] = useState([]);
+      const [bursts, setBursts] = useState([]);
+      const [confetti, setConfetti] = useState([]);
+      const ref = useRef(null);
+      const phaseRef = useRef("start");
+      const scoreRef = useRef(0);
+
+      const setPhaseSync = (p) => { phaseRef.current = p; setPhase(p); };
+
+      const stars = useRef(
+        Array.from({ length: 90 }, (_, i) => ({
+          id: i, x: Math.random() * 100, y: Math.random() * 80,
+          s: 1 + Math.random() * 2.8, d: `${1.5 + Math.random() * 3.5}s`,
+        }))
+      ).current;
+
+      const snow = useRef(
+        Array.from({ length: 50 }, (_, i) => ({
+          id: i, x: Math.random() * 100, s: 2 + Math.random() * 5,
+          d: `${5 + Math.random() * 9}s`, delay: `${-Math.random() * 12}s`,
+          dx: `${(Math.random() - 0.5) * 90}px`,
+        }))
+      ).current;
+
+      useEffect(() => {
+        if (phase !== "play") return;
+        const el = ref.current;
+        const W = el?.offsetWidth || 800, H = el?.offsetHeight || 600;
+
+        let spawnTimer = null;
+        const scheduleSpawn = () => {
+          const lv = getLevel(scoreRef.current);
+          spawnTimer = setTimeout(() => {
+            if (phaseRef.current !== "play") return;
+            const lv2 = getLevel(scoreRef.current);
+            setTickets(p => p.length < lv2.maxOnScreen ? [...p, mkTicket(W, H, lv2.speedMult)] : p);
+            scheduleSpawn();
+          }, lv.spawnMs);
+        };
+        // immediate first spawn
+        const lv0 = getLevel(scoreRef.current);
+        setTickets(p => [...p, mkTicket(W, H, lv0.speedMult)]);
+        scheduleSpawn();
+
+        const mi = setInterval(() => {
+          if (phaseRef.current !== "play") return;
+          setTickets(p =>
+            p.map(t => ({ ...t, x: t.x + t.vx / 10, y: t.y + t.vy / 10 }))
+              .filter(t => t.x > -160 && t.x < W + 60)
+          );
+        }, 50);
+        return () => { clearTimeout(spawnTimer); clearInterval(mi); };
+      }, [phase]);
+
+      const punch = useCallback((e, id) => {
+        e.stopPropagation();
+        if (phaseRef.current !== "play") return;
+        setTickets(p => p.filter(t => t.id !== id));
+        const bid = Date.now() + Math.random();
+        setBursts(p => [...p, { id: bid, x: e.clientX, y: e.clientY }]);
+        setTimeout(() => setBursts(p => p.filter(b => b.id !== bid)), 600);
+        snd.punch();
+        setScore(prev => {
+          const ns = prev + 1;
+          scoreRef.current = ns;
+          if (ns % 5 === 0 && ns < WIN) setTimeout(() => snd.bells(), 140);
+          if (ns >= WIN) {
+            setTimeout(() => {
+              setPhaseSync("won");
+              snd.win();
+              setConfetti(
+                Array.from({ length: 70 }, (_, i) => ({
+                  id: i,
+                  x: Math.random() * 100,
+                  color: ["#ffd700","#ff6b6b","#4ecdc4","#45b7d1","#fff","#ff9f43","#a29bfe"][i % 7],
+                  d: `${2 + Math.random() * 2.5}s`,
+                  delay: `${Math.random() * 0.6}s`,
+                  dx: `${(Math.random() - 0.5) * 220}px`,
+                  w: 6 + Math.random() * 8, h: 10 + Math.random() * 12,
+                }))
+              );
+            }, 80);
+          }
+          return ns;
+        });
+      }, []);
+
+      const startGame = () => {
+        scoreRef.current = 0;
+        setPhaseSync("play"); setScore(0); setTickets([]); setBursts([]); setConfetti([]);
+      };
+
+      const pct = Math.round((score / WIN) * 100);
+      const level = getLevel(score);
+
+      return (
+        <div className="pe-root" ref={ref}>
+          <style>{CSS}</style>
+          {stars.map(s => (
+            <div key={s.id} className="st"
+              style={{ left: `${s.x}%`, top: `${s.y}%`, width: s.s, height: s.s, "--d": s.d }} />
+          ))}
+          {snow.map(f => (
+            <div key={f.id} className="sn"
+              style={{ left: `${f.x}%`, width: f.s, height: f.s, "--d": f.d, "--delay": f.delay, "--dx": f.dx }} />
+          ))}
+          <div className="ground" />
+          {phase === "start" && (
+            <div className="start">
+              <div>
+                <div className="s-eyebrow">🎄 All Aboard the 🎄</div>
+                <div className="s-title">Polar Express</div>
+              </div>
+              <div className="s-badge">🎟️ Conductor's Ticket Punch Game 🎟️</div>
+              <p className="s-desc">
+                Tickets are flying through the train!<br />
+                Tap each ticket to <strong>PUNCH</strong> it before it flies away.<br />
+                Punch <strong>{WIN} tickets</strong> to reach the North Pole! 🏔️<br />
+                <strong>4 levels</strong> — gets faster each time! 🔥
+              </p>
+              <button className="s-btn" onClick={startGame}>
+                🚂 All Aboard! 🚂
+              </button>
+            </div>
+          )}
+          {phase === "play" && (
+            <>
+              <div className="hud">
+                <div className="hud-label">TICKETS PUNCHED</div>
+                <div className="hud-score">
+                  {score} <span style={{ fontSize: "1rem", color: "#a07828" }}>/ {WIN}</span>
+                </div>
+                <div className="prog-track">
+                  <div className="prog-fill" style={{ width: `${pct}%` }} />
+                </div>
+                <div className="hud-sub">{level.label}</div>
+              </div>
+              {tickets.map(t => (
+                <div key={t.id} className="tkt"
+                  style={{ left: t.x, top: t.y, transform: `rotate(${t.rot}deg)`,
+                    filter: "drop-shadow(2px 3px 6px rgba(0,0,0,.6))" }}
+                  onClick={e => punch(e, t.id)}>
+                  <TicketSVG num={t.id} />
+                </div>
+              ))}
+            </>
+          )}
+          {bursts.map(b => <Burst key={b.id} x={b.x} y={b.y} />)}
+          {phase === "won" && (
+            <>
+              {confetti.map(c => (
+                <div key={c.id} className="conf" style={{
+                  left: `${c.x}%`, top: 0, width: c.w, height: c.h,
+                  background: c.color, "--d": c.d, "--delay": c.delay, "--dx": c.dx,
+                }} />
+              ))}
+              <div className="win">
+                <div className="w-emoji">🎄 🚂 🎄</div>
+                <div className="w-title">You Made It!!</div>
+                <div className="w-sub">The train has arrived at the</div>
+                <div className="w-place">✨ NORTH POLE ✨</div>
+                <div className="w-believe">BELIEVE</div>
+                <div className="w-count">You punched all {WIN} tickets! 🎟️🎟️🎟️</div>
+                <button className="w-btn" onClick={startGame}>🚂 Play Again!</button>
+              </div>
+            </>
+          )}
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<PolarExpress />);
+  </script>
+</body>
+</html>
